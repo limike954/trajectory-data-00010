@@ -46,6 +46,62 @@ const timeout = 10 * time.Second
 // device.
 type OwnerModulesFunc func(ctx context.Context, replacementGUID protocol.GUID, info string, chain []*x509.Certificate, devmod serviceinfo.Devmod, supportedMods []string) iter.Seq2[string, serviceinfo.OwnerModule]
 
+type testModuleStateMachine struct {
+	ownerModules OwnerModulesFunc
+	devmod       serviceinfo.DevmodOwnerModule
+	modules      *serviceinfo.IteratorModuleStateMachine
+	ctx          context.Context
+	guid         protocol.GUID
+	info         string
+	chain        []*x509.Certificate
+	started      bool
+}
+
+func newTestModuleStateMachine(ownerModules OwnerModulesFunc) *testModuleStateMachine {
+	return &testModuleStateMachine{ownerModules: ownerModules}
+}
+
+func (m *testModuleStateMachine) InitModules(ctx context.Context, replacementGUID protocol.GUID, info string, chain []*x509.Certificate) {
+	m.devmod = serviceinfo.DevmodOwnerModule{}
+	m.modules = nil
+	m.ctx = ctx
+	m.guid = replacementGUID
+	m.info = info
+	m.chain = chain
+	m.started = false
+}
+
+func (m *testModuleStateMachine) Module(ctx context.Context) (string, serviceinfo.OwnerModule, error) {
+	if !m.started {
+		return "devmod", &m.devmod, nil
+	}
+	return m.modules.Module(ctx)
+}
+
+func (m *testModuleStateMachine) NextModule(ctx context.Context) (bool, error) {
+	if !m.started {
+		m.started = true
+		m.modules = &serviceinfo.IteratorModuleStateMachine{Modules: func(yield func(string, serviceinfo.OwnerModule) bool) {
+			if m.ownerModules == nil {
+				return
+			}
+			mods := m.ownerModules(m.ctx, m.guid, m.info, m.chain, m.devmod.Devmod, m.devmod.Modules)
+			for modName, mod := range mods {
+				if slices.Contains(m.devmod.Modules, modName) && !yield(modName, mod) {
+					return
+				}
+			}
+		}}
+	}
+	return m.modules.NextModule(ctx)
+}
+
+func (m *testModuleStateMachine) CleanupModules(ctx context.Context) {
+	if m.modules != nil {
+		m.modules.CleanupModules(ctx)
+	}
+}
+
 // Config provides options to
 type Config struct {
 	// If state is nil, then an in-memory implementation will be used. This is
@@ -185,22 +241,7 @@ func RunClientTestSuite(t *testing.T, conf Config) {
 		RvInfo: func(context.Context, fdo.Voucher) ([][]protocol.RvInstruction, error) {
 			return [][]protocol.RvInstruction{}, nil
 		},
-		OwnerModules: func(ctx context.Context, replacementGUID protocol.GUID, info string, chain []*x509.Certificate, devmod serviceinfo.Devmod, supportedMods []string) iter.Seq2[string, serviceinfo.OwnerModule] {
-			if conf.OwnerModules == nil {
-				return func(yield func(string, serviceinfo.OwnerModule) bool) {}
-			}
-
-			mods := conf.OwnerModules(ctx, replacementGUID, info, chain, devmod, supportedMods)
-			return func(yield func(string, serviceinfo.OwnerModule) bool) {
-				for modName, mod := range mods {
-					if slices.Contains(supportedMods, modName) {
-						if !yield(modName, mod) {
-							return
-						}
-					}
-				}
-			}
-		},
+		Modules:         newTestModuleStateMachine(conf.OwnerModules),
 		ReuseCredential: func(context.Context, fdo.Voucher) bool { return conf.Reuse },
 		VerifyVoucher:   func(context.Context, fdo.Voucher) error { return nil },
 	}

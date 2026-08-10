@@ -9,15 +9,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"io"
-	"iter"
-	"log/slog"
 	"time"
 
 	"github.com/fido-device-onboard/go-fdo/kex"
-	"github.com/fido-device-onboard/go-fdo/plugin"
 	"github.com/fido-device-onboard/go-fdo/protocol"
 	"github.com/fido-device-onboard/go-fdo/serviceinfo"
 )
@@ -190,9 +186,8 @@ type TO2Server struct {
 	// voucher of the onboarding device.
 	RvInfo func(context.Context, Voucher) ([][]protocol.RvInstruction, error)
 
-	// Create an iterator of service info modules for a given device. The
-	// iterator returns the name of the module and its implementation.
-	OwnerModules func(ctx context.Context, replacementGUID protocol.GUID, info string, chain []*x509.Certificate, devmod serviceinfo.Devmod, modules []string) iter.Seq2[string, serviceinfo.OwnerModule]
+	// Modules maintains TO2 service-info owner module state.
+	Modules serviceinfo.ModuleStateMachine
 
 	// ReuseCredential, if not nil, will be called to determine whether to
 	// apply the Credential Reuse Protocol based on the current voucher of an
@@ -206,11 +201,6 @@ type TO2Server struct {
 	// If VerifyVoucher is nil, the default behavior is to reject all vouchers
 	// with zero extensions.
 	VerifyVoucher func(context.Context, Voucher) error
-
-	// Server affinity state
-	nextModule func() (string, serviceinfo.OwnerModule, bool)
-	stop       func()
-	plugins    map[string]plugin.Module
 
 	// Optional configuration
 	MaxDeviceServiceInfoSize uint16
@@ -287,33 +277,10 @@ func (s *TO2Server) Respond(ctx context.Context, msgType uint8, msg io.Reader) (
 		resp, err = s.to2Done2(ctx, msg)
 	}
 
-	// Stop any running plugins if TO2 ended (possibly by error)
-	if (msgType == protocol.TO2DeviceServiceInfoMsgType && err != nil) || msgType == protocol.TO2DoneMsgType {
-		// Close owner module iterator
-		s.stop()
-
-		// Start goroutines to gracefully/forcefully stop plugins. Stopping is
-		// given an absolute timeout not tied to the expiration of the request
-		// context.
-		pluginStopCtx, _ := context.WithTimeout(context.Background(), 5*time.Second) //nolint:govet
-		for name, p := range s.plugins {
-			pluginGracefulStopCtx, done := context.WithCancel(pluginStopCtx)
-
-			// Allow Graceful stop up to the original shared timeout
-			go func(p plugin.Module) {
-				defer done()
-				if err := p.GracefulStop(pluginGracefulStopCtx); err != nil && !errors.Is(err, context.Canceled) { //nolint:revive,staticcheck
-					slog.Warn("graceful stop failed", "module", name, "error", err)
-				}
-			}(p)
-
-			// Force stop after the shared timeout expires or graceful stop
-			// completes
-			go func(p plugin.Module) {
-				<-pluginGracefulStopCtx.Done()
-				_ = p.Stop()
-				// TODO: Track state for whether plugins are still stopping
-			}(p)
+	// Stop any running modules if service-info failed or TO2 completed.
+	if (msgType == protocol.TO2DeviceServiceInfoMsgType && err != nil) || (msgType == protocol.TO2DoneMsgType && err == nil) {
+		if s.Modules != nil {
+			s.Modules.CleanupModules(ctx)
 		}
 	}
 

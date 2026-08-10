@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"iter"
 	"log"
@@ -588,10 +589,63 @@ func newHandler(rvInfo [][]protocol.RvInstruction, state *sqlite.DB) (*transport
 			Vouchers:        state,
 			OwnerKeys:       state,
 			RvInfo:          func(context.Context, fdo.Voucher) ([][]protocol.RvInstruction, error) { return rvInfo, nil },
-			OwnerModules:    ownerModules,
+			Modules:         newServerModuleStateMachine(ownerModules),
 			ReuseCredential: func(context.Context, fdo.Voucher) bool { return reuseCred },
 		},
 	}, nil
+}
+
+type serverModuleStateMachine struct {
+	ownerModules func(context.Context, protocol.GUID, string, []*x509.Certificate, serviceinfo.Devmod, []string) iter.Seq2[string, serviceinfo.OwnerModule]
+	devmod       serviceinfo.DevmodOwnerModule
+	modules      *serviceinfo.IteratorModuleStateMachine
+	ctx          context.Context
+	guid         protocol.GUID
+	info         string
+	chain        []*x509.Certificate
+	started      bool
+}
+
+func newServerModuleStateMachine(ownerModules func(context.Context, protocol.GUID, string, []*x509.Certificate, serviceinfo.Devmod, []string) iter.Seq2[string, serviceinfo.OwnerModule]) *serverModuleStateMachine {
+	return &serverModuleStateMachine{ownerModules: ownerModules}
+}
+
+func (m *serverModuleStateMachine) InitModules(ctx context.Context, guid protocol.GUID, info string, chain []*x509.Certificate) {
+	m.devmod = serviceinfo.DevmodOwnerModule{}
+	m.modules = nil
+	m.ctx = ctx
+	m.guid = guid
+	m.info = info
+	m.chain = chain
+	m.started = false
+}
+
+func (m *serverModuleStateMachine) Module(ctx context.Context) (string, serviceinfo.OwnerModule, error) {
+	if !m.started {
+		return "devmod", &m.devmod, nil
+	}
+	return m.modules.Module(ctx)
+}
+
+func (m *serverModuleStateMachine) NextModule(ctx context.Context) (bool, error) {
+	if !m.started {
+		m.started = true
+		m.modules = &serviceinfo.IteratorModuleStateMachine{Modules: func(yield func(string, serviceinfo.OwnerModule) bool) {
+			mods := m.ownerModules(m.ctx, m.guid, m.info, m.chain, m.devmod.Devmod, m.devmod.Modules)
+			for modName, mod := range mods {
+				if !yield(modName, mod) {
+					return
+				}
+			}
+		}}
+	}
+	return m.modules.NextModule(ctx)
+}
+
+func (m *serverModuleStateMachine) CleanupModules(ctx context.Context) {
+	if m.modules != nil {
+		m.modules.CleanupModules(ctx)
+	}
 }
 
 //nolint:gocyclo
