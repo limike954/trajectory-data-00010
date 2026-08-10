@@ -81,3 +81,8 @@ func errorMsg(ctx context.Context, transport Transport, err error) {
 		_ = rc.Close()
 	}
 }
+
+// HandleError handles a received protocol error.
+func (s *TO2Server) HandleError(ctx context.Context, _ protocol.ErrorMessage) {
+	s.Modules.CleanupModules(ctx)
+}
