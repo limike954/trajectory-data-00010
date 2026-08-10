@@ -1,0 +1,36 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck
+    - gocyclo
+    - gofmt
+    - goimports
+    - govet
+    - revive
+    - staticcheck
+    - gosec
+    - misspell
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  goimports:
+    local-prefixes: github.com/limike954/trajectory-data-00010
+  misspell:
+    locale: US
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude:
+    - 'declaration of "(err|ctx)" shadows declaration at'
+    - "^unused-parameter: "
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gocyclo
+        - gosec
