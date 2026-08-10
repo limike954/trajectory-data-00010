@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"iter"
 	"log/slog"
 	"math"
 	"reflect"
@@ -195,7 +194,6 @@ func TO2(ctx context.Context, transport Transport, to1d *cose.Sign1[protocol.To1
 	// in a goroutine because the pipe is unbuffered and needs to be
 	// concurrently read by the send/receive service info loop.
 	serviceInfoReader, serviceInfoWriter := serviceinfo.NewChunkOutPipe(0)
-	defer func() { _ = serviceInfoWriter.Close() }()
 
 	// Send devmod KVs in initial ServiceInfo
 	go c.Devmod.Write(ctx, c.DeviceModules, sendMTU, serviceInfoWriter)
@@ -1098,6 +1096,11 @@ type ownerServiceInfoReady struct {
 	MaxDeviceServiceInfoSize *uint16 // maximum size service info that Owner can receive
 }
 
+type to2ModuleStateMachine interface {
+	serviceinfo.ModuleStateMachine
+	InitModules(context.Context, protocol.GUID, string, []*x509.Certificate)
+}
+
 // DeviceServiceInfoReady(66) -> OwnerServiceInfoReady(67)
 func (s *TO2Server) ownerServiceInfoReady(ctx context.Context, msg io.Reader) (*ownerServiceInfoReady, error) {
 	// Parse request
@@ -1144,29 +1147,9 @@ func (s *TO2Server) ownerServiceInfoReady(ctx context.Context, msg io.Reader) (*
 		}
 	}
 
-	// Initialize service info modules
-	s.plugins = make(map[string]plugin.Module)
-	s.nextModule, s.stop = iter.Pull2(func() iter.Seq2[string, serviceinfo.OwnerModule] {
-		var devmod devmodOwnerModule
-		var ownerModules iter.Seq2[string, serviceinfo.OwnerModule]
-
-		return func(yield func(string, serviceinfo.OwnerModule) bool) {
-			if ownerModules == nil {
-				if !yield("devmod", &devmod) {
-					return
-				}
-				ownerModules = s.OwnerModules(ctx, guid, info, deviceCertChain, devmod.Devmod, devmod.Modules)
-			}
-
-			ownerModules(func(moduleName string, mod serviceinfo.OwnerModule) bool {
-				if p, ok := mod.(plugin.Module); ok {
-					// Collect plugins before yielding the module
-					s.plugins[moduleName] = p
-				}
-				return yield(moduleName, mod)
-			})
-		}
-	}())
+	if modules, ok := s.Modules.(to2ModuleStateMachine); ok {
+		modules.InitModules(ctx, guid, info, deviceCertChain)
+	}
 
 	// Send response
 	ownerReady := new(ownerServiceInfoReady)
@@ -1473,13 +1456,17 @@ func (s *TO2Server) ownerServiceInfo(ctx context.Context, msg io.Reader) (*owner
 	}
 
 	// Get next owner service info module
-	moduleName, mod, ok := s.nextModule()
-	if !ok {
+	moduleName, mod, err := s.Modules.Module(ctx)
+	if errors.Is(err, io.EOF) {
 		return &ownerServiceInfo{
 			IsMoreServiceInfo: false,
 			IsDone:            true,
 			ServiceInfo:       nil,
 		}, nil
+	}
+	if err != nil {
+		s.Modules.CleanupModules(ctx)
+		return nil, fmt.Errorf("error getting owner service info module: %w", err)
 	}
 
 	// Handle data with owner module
@@ -1514,8 +1501,6 @@ func (s *TO2Server) ownerServiceInfo(ctx context.Context, msg io.Reader) (*owner
 	}
 
 	if deviceInfo.IsMoreServiceInfo {
-		s.continueWithModule(moduleName, mod)
-
 		return &ownerServiceInfo{
 			IsMoreServiceInfo: false,
 			IsDone:            false,
@@ -1524,15 +1509,6 @@ func (s *TO2Server) ownerServiceInfo(ctx context.Context, msg io.Reader) (*owner
 	}
 
 	return s.produceOwnerServiceInfo(ctx, moduleName, mod)
-}
-
-// Override nextModule so that the same module is used in the next round
-func (s *TO2Server) continueWithModule(moduleName string, mod serviceinfo.OwnerModule) {
-	nextModule := s.nextModule
-	s.nextModule = func() (string, serviceinfo.OwnerModule, bool) {
-		s.nextModule = nextModule
-		return moduleName, mod, true
-	}
 }
 
 // Allow owner module to produce data
@@ -1545,6 +1521,7 @@ func (s *TO2Server) produceOwnerServiceInfo(ctx context.Context, moduleName stri
 	producer := serviceinfo.NewProducer(moduleName, mtu)
 	explicitBlock, isComplete, err := mod.ProduceInfo(ctx, producer)
 	if err != nil {
+		s.Modules.CleanupModules(ctx)
 		return nil, fmt.Errorf("error producing owner service info from module: %w", err)
 	}
 
@@ -1552,9 +1529,17 @@ func (s *TO2Server) produceOwnerServiceInfo(ctx context.Context, moduleName stri
 		return nil, fmt.Errorf("owner service info module produced service info exceeding the MTU=%d - 3 (message overhead), size=%d", mtu, size)
 	}
 
-	// If module is not yet complete, override nextModule to return it again
-	if !isComplete {
-		s.continueWithModule(moduleName, mod)
+	if isComplete {
+		if next, err := s.Modules.NextModule(ctx); err != nil {
+			s.Modules.CleanupModules(ctx)
+			return nil, fmt.Errorf("error advancing owner service info module: %w", err)
+		} else if !next {
+			return &ownerServiceInfo{
+				IsMoreServiceInfo: explicitBlock,
+				IsDone:            true,
+				ServiceInfo:       producer.ServiceInfo(),
+			}, nil
+		}
 	}
 
 	// Return chunked data

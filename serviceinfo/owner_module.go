@@ -26,6 +26,13 @@ type OwnerModule interface {
 	ProduceInfo(ctx context.Context, producer *Producer) (blockPeer, moduleDone bool, _ error)
 }
 
+// ModuleStateMachine maintains TO2 service-info owner module state.
+type ModuleStateMachine interface {
+	Module(context.Context) (string, OwnerModule, error)
+	NextModule(context.Context) (bool, error)
+	CleanupModules(context.Context)
+}
+
 // Producer allows an owner service info module to produce service info either
 // with auto-chunking (not yet implemented) or manually.
 type Producer struct {
