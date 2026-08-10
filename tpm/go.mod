@@ -5,8 +5,8 @@ go 1.23.0
 replace github.com/limike954/trajectory-data-00010 => ../
 
 require (
+	github.com/google/go-tpm v0.9.8
 	github.com/limike954/trajectory-data-00010 v0.0.0-00010101000000-000000000000
-	github.com/google/go-tpm v0.9.3
 )
 
 require (
